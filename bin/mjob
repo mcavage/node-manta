@@ -2,6 +2,7 @@
 // -*- mode: js -*-
 // Copyright (c) 2013, Joyent, Inc. All rights reserved.
 
+var dgram = require('dgram');
 var EventEmitter = require('events').EventEmitter;
 var fs = require('fs');
 var path = require('path');
@@ -33,6 +34,8 @@ var LOG = bunyan.createLogger({
     stream: process.stderr,
     serializers: restify.bunyan.serializers
 });
+
+var STATS_ASSET = '/manta/public/job_stats/v0.0.0/collector.sh';
 
 
 
@@ -678,55 +681,113 @@ MJob.prototype.do_create = function create(subcmd, opts, args, cb) {
         return;
     }
 
-    var client = createClient(opts);
-    client.createJob(job, function (err, id) {
-        if (err) {
-            cb(err);
-            return;
-        }
+    function _createJob() {
+        var client = createClient(opts);
+        client.createJob(job, function (err, id) {
+            if (err) {
+                cb(err);
+                return;
+            }
 
-        if (!opts.cat_outputs)
-            console.log(id);
+            if (!opts.cat_outputs)
+                console.log(id);
 
-        if (process.stdin.isTTY) {
-            if (!opts.close && !opts.open)
-                console.error('mjob: warning: input stream left open');
+            if (process.stdin.isTTY) {
+                if (!opts.close && !opts.open)
+                    console.error('mjob: warning: input stream left open');
 
-            if (opts.close) {
-                client.endJob(id, function onEndJob(err2) {
+                if (opts.close) {
+                    client.endJob(id, function onEndJob(err2) {
+                        if (err2) {
+                            cb(err2);
+                            return;
+                        }
+
+                        jobWait({
+                            client: client,
+                            id: id,
+                            opts: opts
+                        }, cb);
+                    });
+                } else {
+                    jobWait({
+                        client: client,
+                        id: id,
+                        opts: opts
+                    }, cb);
+                }
+            } else {
+                opts.jobIds = [id];
+                addInputsFromStdin(client, opts, function (err2) {
                     if (err2) {
                         cb(err2);
                         return;
                     }
-
                     jobWait({
                         client: client,
                         id: id,
                         opts: opts
                     }, cb);
                 });
-            } else {
-                jobWait({
-                    client: client,
-                    id: id,
-                    opts: opts
-                }, cb);
             }
-        } else {
-            opts.jobIds = [id];
-            addInputsFromStdin(client, opts, function (err2) {
-                if (err2) {
-                    cb(err2);
-                    return;
-                }
-                jobWait({
-                    client: client,
-                    id: id,
-                    opts: opts
-                }, cb);
+        });
+    }
+
+    function startMonitor() {
+        var http = require('http');
+
+        var start_opts = {
+            hostname: '165.225.139.75',
+            port: 4321,
+            path: '/start?login=' + opts.account,
+            method: 'POST'
+        };
+        var req = http.request(start_opts, function (res) {
+            if (res.statusCode !== 200) {
+                cb(new Error('unable to start monitoring subsystem'));
+                return;
+            }
+
+            res.body = '';
+            res.setEncoding('utf8');
+            res.on('data', function (chunk) {
+                res.body += chunk;
             });
-        }
-    });
+            res.once('end', function () {
+                var msg;
+                try {
+                    msg = JSON.parse(res.body);
+                } catch (e) {
+                    cb(e);
+                }
+
+                job.phases = job.phases.map(function (p) {
+                    p.assets = p.assets || [];
+                    p.assets.push(STATS_ASSET);
+
+                    var init = p.init || '';
+                    p.init = 'ctrun -l none /assets' + STATS_ASSET + ' ' +
+                        msg.token + ' ' +
+                        '165.225.139.75' + ' ' +
+                        msg.port + ' ; ' +
+                        init;
+
+                    return (p);
+                });
+
+                _createJob();
+            });
+        });
+
+        req.once('error', cb);
+        req.end();
+    }
+
+    if (!opts.monitor) {
+        _createJob();
+    } else {
+        startMonitor();
+    }
 };
 
 MJob.prototype.do_create.options = manta.DEFAULT_CLI_OPTIONS.concat([
@@ -788,7 +849,12 @@ MJob.prototype.do_create.options = manta.DEFAULT_CLI_OPTIONS.concat([
         names: ['map', 'm'],
         type: 'arrayOfString',
         help: 'map phase(s)',
-        helpArh: 'MAP_COMMAND'
+        helpArg: 'MAP_COMMAND'
+    },
+    {
+        names: ['monitor'],
+        type: 'bool',
+        help: 'create job with real-time monitoring capability'
     },
     {
         names: ['name', 'n'],
@@ -1554,6 +1620,108 @@ MJob.prototype.do_cost.help = (
     '\n' +
     '{{options}}'
 );
+
+
+
+//-- Watch
+
+MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
+    cb = once(cb);
+
+    if (!assertOpts(this, subcmd, opts, cb))
+        return;
+
+    if (args.length > 1) {
+        cb(new Error('only one jobId can be monitored'));
+        return;
+    }
+
+    var client = createClient(opts);
+
+    client.job(args[0], function (err, job) {
+        if (err) {
+            cb(err);
+            return;
+        }
+
+        var j = job.phases[0];
+        if ((j.assets || []).indexOf(STATS_ASSET) === -1) {
+            cb(new Error(args[0] + ' was not created with --monitor'));
+            return;
+        }
+
+        var init = j.init.split(';')[0].split(/\s+/);
+
+        var buf = new Buffer(JSON.stringify({
+            tok: init[4],
+            t: 'connect'
+        }));
+
+        var ip = init[5];
+        var port = parseInt(init[6], 10);
+        var socket = dgram.createSocket('udp4');
+        var vals = [];
+        var _close = new Buffer(JSON.stringify({
+            tok: init[4],
+            t: 'close'
+        }));
+
+        var t = setInterval(function () {
+            if (vals.length) {
+                console.log(vals.join(' '));
+                vals.length = 0;
+            }
+        }, 1000);
+
+        socket.on('message', function (msg) {
+            vals.push(msg.toString().split('|').shift().split(':').pop());
+        });
+        socket.send(buf, 0, buf.length, port, ip);
+
+        var poll_opts = {
+            client: client,
+            job: args[0]
+        };
+        jobWatch(poll_opts, function (w_err) {
+            socket.send(_close, 0, _close.length, port, ip);
+            if (w_err) {
+                cb(w_err);
+                return;
+            }
+            clearInterval(t);
+            client.close();
+
+            socket.removeAllListeners('close');
+            process.nextTick(function () {
+                socket.close();
+                cb();
+            });
+        });
+    });
+};
+
+
+MJob.prototype.do_monitor.options = manta.DEFAULT_CLI_OPTIONS.concat([
+    {
+        names: ['heatmap', 'p'],
+        type: 'bool',
+        help: 'output to heatmap format'
+    }
+]);
+
+MJob.prototype.do_monitor.help = (
+    'Monitors a job and produces a real-time visualization of statistics.\n' +
+        'Example:\n' +
+        '    mjob monitor --heatmap b19e0925-4c85-4fe9-ab47-8cc9dcfec81a' +
+        ' | heatmap\n' +
+        '\n' +
+        'Usage:\n' +
+        '     mjob monitor [OPTIONS] JobId\n' +
+        '\n' +
+        '{{options}}'
+);
+
+
 
 ///--- Mainline
 
