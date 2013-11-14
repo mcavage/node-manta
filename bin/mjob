@@ -1707,7 +1707,7 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
                     val: n
                 });
             },
-            title: opts.stat
+            title: args[0] + ': ' + opts.stat
         });
         ss.pipe(process.stdout);
         break;
