@@ -17,6 +17,7 @@ var LineStream = require('lstream');
 var moment = require('moment');
 var once = require('once');
 var restify = require('restify');
+var spark_stream = require('sparkstream');
 
 var manta = require('../lib');
 
@@ -35,8 +36,9 @@ var LOG = bunyan.createLogger({
     serializers: restify.bunyan.serializers
 });
 
-var STATS_ASSET = '/manta/public/job_stats/v0.0.0/collector.sh';
-
+var STATS_ASSET_DIR = '/manta/public/job_stats/v0.0.0';
+var STATS_ASSET = STATS_ASSET_DIR + '/collector.js';
+var STATS_ASSET_TAR = STATS_ASSET_DIR + '/collector.tar';
 
 
 ///-- Helpers
@@ -763,14 +765,18 @@ MJob.prototype.do_create = function create(subcmd, opts, args, cb) {
 
                 job.phases = job.phases.map(function (p) {
                     p.assets = p.assets || [];
-                    p.assets.push(STATS_ASSET);
+                    p.assets.push(STATS_ASSET_TAR);
 
                     var init = p.init || '';
-                    p.init = 'ctrun -l none /assets' + STATS_ASSET + ' ' +
-                        msg.token + ' ' +
-                        '165.225.139.75' + ' ' +
-                        msg.port + ' ; ' +
-                        init;
+                    var ip = '165.225.139.75';
+                    p.init = sprintf('tar -xf /assets%s -C /var/tmp && ' +
+                                     'ctrun -l none /var/tmp/collector.js ' +
+                                     '%s %s %s ; %s',
+                                     STATS_ASSET_TAR,
+                                     msg.token,
+                                     ip,
+                                     msg.port,
+                                     init);
 
                     return (p);
                 });
@@ -1637,6 +1643,78 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
     }
 
     var client = createClient(opts);
+    var vals = [];
+    function allow(msg) {
+        var ok;
+        var tmp = msg.split('.');
+        switch (opts.stat) {
+        case 'cpu':
+            ok = /cpu/.test(tmp[1]) && /perc_total/.test(tmp[2]);
+            break;
+        case 'waitrq':
+            ok = /cpu/.test(tmp[1]) && /perc_waitrq/.test(tmp[2]);
+            break;
+        case 'iops':
+            ok = /vfs/.test(tmp[1]) && /iops_total/.test(tmp[2]);
+            break;
+        case 'vmm':
+            break;
+        default:
+            ok = false;
+            break;
+        }
+
+        return (ok);
+    }
+
+    function heatmap(v) {
+        vals.push(v);
+    }
+
+    function statsd(v) {
+        // TODO forward to statsd
+    }
+
+    function spark(v) {
+        ss.write(v);
+    }
+
+    var modeFn;
+    switch (opts.mode) {
+    case 'heatmap':
+        modeFn = heatmap;
+        var t = setInterval(function () {
+            console.log(vals.map(function (v) {
+                return (v.split('|').shift().split(':').pop());
+            }).join(' '));
+            vals.length = 0;
+        }, 1000);
+        break;
+    case 'statsd':
+        modeFn = statsd;
+        break;
+    case 'spark':
+        modeFn = spark;
+        var ss = spark_stream.createStream({
+            parse: function parse(msg) {
+                var components = msg.split('.');
+                var name = components[0].replace('\u00B7', '.');
+                var val = components[components.length - 1];
+                var n = val.split('|').shift().split(':').pop();
+
+                return ({
+                    prefix: name + ': ',
+                    val: n
+                });
+            },
+            title: opts.stat
+        });
+        ss.pipe(process.stdout);
+        break;
+    default:
+        cb(new Error('Invalid mode ' + opts.mode));
+        break;
+    }
 
     client.job(args[0], function (err, job) {
         if (err) {
@@ -1645,36 +1723,38 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
         }
 
         var j = job.phases[0];
-        if ((j.assets || []).indexOf(STATS_ASSET) === -1) {
+        if ((j.assets || []).indexOf(STATS_ASSET_TAR) === -1) {
             cb(new Error(args[0] + ' was not created with --monitor'));
             return;
         }
 
-        var init = j.init.split(';')[0].split(/\s+/);
+        var init = j.init.split(';')[0].split(/\s+&&\s+/).pop().split(/\s+/);
 
         var buf = new Buffer(JSON.stringify({
             tok: init[4],
             t: 'connect'
         }));
+        var ping = new Buffer(JSON.stringify({
+            tok: init[4],
+            t: 'ping'
+        }));
 
         var ip = init[5];
         var port = parseInt(init[6], 10);
         var socket = dgram.createSocket('udp4');
-        var vals = [];
         var _close = new Buffer(JSON.stringify({
             tok: init[4],
             t: 'close'
         }));
 
-        var t = setInterval(function () {
-            if (vals.length) {
-                console.log(vals.join(' '));
-                vals.length = 0;
-            }
-        }, 1000);
+        var pinger = setInterval(function () {
+            socket.send(ping, 0, ping.length, port, ip);
+        }, 15000);
 
         socket.on('message', function (msg) {
-            vals.push(msg.toString().split('|').shift().split(':').pop());
+            msg = msg.toString();
+            if (opts.mode === 'statsd' || allow(msg))
+                modeFn(msg);
         });
         socket.send(buf, 0, buf.length, port, ip);
 
@@ -1683,16 +1763,18 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
             job: args[0]
         };
         jobWatch(poll_opts, function (w_err) {
-            socket.send(_close, 0, _close.length, port, ip);
+            clearInterval(t);
+            clearInterval(pinger);
+            client.close();
+
             if (w_err) {
+                socket.close();
                 cb(w_err);
                 return;
             }
-            clearInterval(t);
-            client.close();
 
-            socket.removeAllListeners('close');
-            process.nextTick(function () {
+            socket.send(_close, 0, _close.length, port, ip, function () {
+                socket.removeAllListeners('close');
                 socket.close();
                 cb();
             });
@@ -1703,16 +1785,28 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
 
 MJob.prototype.do_monitor.options = manta.DEFAULT_CLI_OPTIONS.concat([
     {
-        names: ['heatmap', 'p'],
-        type: 'bool',
-        help: 'output to heatmap format'
+        names: ['mode', 'm'],
+        type: 'string',
+        help: 'output mode: heatmap, spark, statsd',
+        'default': 'spark'
+    },
+    {
+        names: ['stat', 's'],
+        type: 'string',
+        help: 'stat to monitor: cpu, iops, waitrq',
+        'default': 'cpu'
+    },
+    {
+        names: ['filter', 'f'],
+        type: 'arrayOfString',
+        help: 'show stats for these objects'
     }
 ]);
 
 MJob.prototype.do_monitor.help = (
     'Monitors a job and produces a real-time visualization of statistics.\n' +
         'Example:\n' +
-        '    mjob monitor --heatmap b19e0925-4c85-4fe9-ab47-8cc9dcfec81a' +
+        '    mjob monitor b19e0925-4c85-4fe9-ab47-8cc9dcfec81a' +
         ' | heatmap\n' +
         '\n' +
         'Usage:\n' +
