@@ -771,11 +771,12 @@ MJob.prototype.do_create = function create(subcmd, opts, args, cb) {
                     var ip = '165.225.139.75';
                     p.init = sprintf('tar -xf /assets%s -C /var/tmp && ' +
                                      'ctrun -l none /var/tmp/collector.js ' +
-                                     '%s %s %s ; %s',
+                                     '%s %s %s %s ; %s',
                                      STATS_ASSET_TAR,
                                      msg.token,
                                      ip,
                                      msg.port,
+                                     p.type || 'map',
                                      init);
 
                     return (p);
@@ -1671,10 +1672,6 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
         vals.push(v);
     }
 
-    function statsd(v) {
-        // TODO forward to statsd
-    }
-
     function spark(v) {
         ss.write(v);
     }
@@ -1690,12 +1687,10 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
             vals.length = 0;
         }, 1000);
         break;
-    case 'statsd':
-        modeFn = statsd;
-        break;
     case 'spark':
         modeFn = spark;
         var ss = spark_stream.createStream({
+            maxIdle: 5000,
             parse: function parse(msg) {
                 var components = msg.split('.');
                 var name = components[0].replace('\u00B7', '.');
@@ -1711,6 +1706,10 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
         });
         ss.pipe(process.stdout);
         break;
+    case 'statsd':
+        // noop
+        break;
+
     default:
         cb(new Error('Invalid mode ' + opts.mode));
         break;
@@ -1732,31 +1731,43 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
 
         var buf = new Buffer(JSON.stringify({
             tok: init[4],
-            t: 'connect'
+            t: opts.mode === 'statsd' ? 'redirect' : 'connect',
+            msg: opts.mode === 'statsd' ? '165.225.150.197:8125' : undefined
         }));
+
         var ping = new Buffer(JSON.stringify({
             tok: init[4],
             t: 'ping'
         }));
 
         var ip = init[5];
+        var pinger;
         var port = parseInt(init[6], 10);
         var socket = dgram.createSocket('udp4');
-        var _close = new Buffer(JSON.stringify({
-            tok: init[4],
-            t: 'close'
-        }));
 
-        var pinger = setInterval(function () {
-            socket.send(ping, 0, ping.length, port, ip);
-        }, 15000);
+        socket.send(buf, 0, buf.length, port, ip, function (udp_err) {
+            if (udp_err) {
+                cb(udp_err);
+                return;
+            }
 
-        socket.on('message', function (msg) {
-            msg = msg.toString();
-            if (opts.mode === 'statsd' || allow(msg))
-                modeFn(msg);
+            if (opts.mode === 'statsd') {
+                client.close();
+                socket.close();
+                cb();
+                return;
+            }
+
+            socket.on('message', function (msg) {
+                msg = msg.toString();
+                if (allow(msg))
+                    modeFn(msg);
+            });
+
+            pinger = setInterval(function () {
+                socket.send(ping, 0, ping.length, port, ip);
+            }, 15000);
         });
-        socket.send(buf, 0, buf.length, port, ip);
 
         var poll_opts = {
             client: client,
@@ -1773,9 +1784,15 @@ MJob.prototype.do_monitor = function do_monitor(subcmd, opts, args, cb) {
                 return;
             }
 
+            var _close = new Buffer(JSON.stringify({
+                tok: init[4],
+                t: 'close'
+            }));
             socket.send(_close, 0, _close.length, port, ip, function () {
                 socket.removeAllListeners('close');
                 socket.close();
+                // clear screen
+                process.stdout.write(new Buffer('\033[H\033[2J'));
                 cb();
             });
         });
